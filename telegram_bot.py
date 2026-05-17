@@ -26,10 +26,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Константы
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
-ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
+# Константы - ИСПРАВЛЕННОЕ ЧТЕНИЕ
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY') or os.getenv('ANTHROPIC_API_KEY')
+ADMIN_ID_STR = os.environ.get('ADMIN_ID') or os.getenv('ADMIN_ID', '0')
+
+# Проверка что ключи есть
+if not TELEGRAM_TOKEN:
+    logger.error("❌ TELEGRAM_BOT_TOKEN не установлен!")
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+
+if not ANTHROPIC_API_KEY:
+    logger.error("❌ ANTHROPIC_API_KEY не установлен!")
+    raise ValueError("ANTHROPIC_API_KEY environment variable is required")
+
+try:
+    ADMIN_ID = int(ADMIN_ID_STR)
+except (ValueError, TypeError):
+    logger.error(f"❌ ADMIN_ID должен быть числом, получено: {ADMIN_ID_STR}")
+    ADMIN_ID = 0
+
+logger.info(f"✅ Переменные загружены успешно")
+logger.info(f"✅ TELEGRAM_TOKEN: {TELEGRAM_TOKEN[:10]}...")
+logger.info(f"✅ ANTHROPIC_API_KEY: {ANTHROPIC_API_KEY[:10]}...")
+logger.info(f"✅ ADMIN_ID: {ADMIN_ID}")
 
 # Файл с авторизованными пользователями
 AUTHORIZED_USERS_FILE = 'authorized_users.json'
