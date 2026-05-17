@@ -1,21 +1,27 @@
 import os
+import io
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ConversationHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 from anthropic import Anthropic
+
+# Чтение .docx (для пользовательских шаблонов и присланных договоров)
+try:
+    from docx import Document as DocxDocument
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -58,385 +64,376 @@ logger.info(f"✅ ADMIN_ID: {ADMIN_ID}")
 DATA_DIR = os.environ.get('DATA_DIR', '.')
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Папка для сгенерированных договоров внутри постоянного хранилища
-CONTRACTS_DIR = os.path.join(DATA_DIR, 'contracts')
-os.makedirs(CONTRACTS_DIR, exist_ok=True)
-
-# Файл с авторизованными пользователями (в постоянном хранилище)
-AUTHORIZED_USERS_FILE = os.path.join(DATA_DIR, 'authorized_users.json')
+# Файл с пользовательскими шаблонами договоров (общие для всех)
+TEMPLATES_FILE = os.path.join(DATA_DIR, 'custom_templates.json')
 
 logger.info(f"✅ DATA_DIR: {DATA_DIR}")
 
-# Состояния для ConversationHandler
-WAITING_FOR_CLIENT_DATA = 1
-WAITING_FOR_CONTRACT_TYPE = 2
-WAITING_FOR_CONTRACT_PARAMS = 3
-GENERATING_CONTRACT = 4
+# ============ Настройки модели и диалога ============
+
+# Используемая модель Claude
+CLAUDE_MODEL = "claude-sonnet-4-6"
+
+# Сколько последних сообщений диалога хранить (user + assistant суммарно)
+MAX_HISTORY_MESSAGES = 20
+
+# Через сколько часов простоя контекст диалога обнуляется
+CONTEXT_RESET_HOURS = 24
+
+# Максимум токенов в ответе
+MAX_TOKENS = 4000
+
+# Дисклеймер, добавляется к юридическим результатам
+DISCLAIMER = (
+    "\n\n———\n"
+    "⚠️ Это черновик, подготовленный AI. Перед подписанием проверьте документ "
+    "у юриста — особенно для сделок с недвижимостью."
+)
 
 # Инициализируем Anthropic клиент
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ============ Управление авторизацией ============
+# ============ Управление шаблонами ============
 
-def load_authorized_users() -> dict:
-    """Загружает список авторизованных пользователей"""
-    if os.path.exists(AUTHORIZED_USERS_FILE):
-        with open(AUTHORIZED_USERS_FILE, 'r') as f:
+def load_templates() -> dict:
+    """Загружает пользовательские шаблоны договоров"""
+    if os.path.exists(TEMPLATES_FILE):
+        with open(TEMPLATES_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {}
 
-def save_authorized_users(users: dict):
-    """Сохраняет список авторизованных пользователей"""
-    with open(AUTHORIZED_USERS_FILE, 'w') as f:
-        json.dump(users, f, indent=2, ensure_ascii=False)
-
-def is_authorized(user_id: int) -> bool:
-    """Проверяет, авторизован ли пользователь"""
-    users = load_authorized_users()
-    return str(user_id) in users and users[str(user_id)]['active']
+def save_templates(templates: dict):
+    """Сохраняет пользовательские шаблоны договоров"""
+    with open(TEMPLATES_FILE, 'w', encoding='utf-8') as f:
+        json.dump(templates, f, indent=2, ensure_ascii=False)
 
 def is_admin(user_id: int) -> bool:
     """Проверяет, является ли пользователь администратором"""
     return user_id == ADMIN_ID
 
+# ============ Системный промпт ============
+
+def build_system_prompt() -> str:
+    """Собирает системный промпт с ролью и шаблонами договоров"""
+    prompt = (
+        "Ты — юридический ассистент в Telegram-боте, специалист по сделкам "
+        "с недвижимостью в России: купля-продажа, аренда, займ, расписки, "
+        "договоры подряда и сопутствующие документы.\n\n"
+        "Твоя задача — помогать пользователю в свободной беседе:\n"
+        "• составлять договоры по описанию задачи (в свободной форме);\n"
+        "• анализировать присланные договоры — указывать риски, слабые места "
+        "и предлагать недостающие юридические пункты;\n"
+        "• отвечать на вопросы по договорам и сделкам с недвижимостью.\n\n"
+        "Правила:\n"
+        "• Пиши на русском языке, понятно и по делу.\n"
+        "• Если пользователь просит составить договор — выдавай полный, "
+        "структурированный, готовый к подписанию документ с нумерацией "
+        "разделов (1.1, 1.2 и т.д.). Недостающие данные оставляй как "
+        "[placeholder] для заполнения.\n"
+        "• Опирайся на законодательство РФ (ГК РФ и профильные нормы).\n"
+        "• Если данных не хватает — задай уточняющие вопросы, прежде чем "
+        "составлять документ.\n"
+        "• Если для нужного вида договора есть подходящий шаблон ниже — "
+        "бери его за основу, адаптируя под запрос пользователя.\n"
+    )
+
+    templates = load_templates()
+    if templates:
+        prompt += "\n=== ШАБЛОНЫ ДОГОВОРОВ ===\n"
+        for name, body in templates.items():
+            prompt += f"\n--- ШАБЛОН: {name} ---\n{body}\n--- КОНЕЦ ШАБЛОНА ---\n"
+    else:
+        prompt += "\n(Пользовательские шаблоны пока не добавлены.)\n"
+
+    return prompt
+
+# ============ Вспомогательные функции ============
+
+def extract_text_from_docx(file_bytes: bytes) -> str:
+    """Извлекает текст из .docx файла"""
+    if not HAS_DOCX:
+        return ""
+    doc = DocxDocument(io.BytesIO(file_bytes))
+    return "\n".join(p.text for p in doc.paragraphs)
+
+async def read_document_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    """Считывает текст из присланного документа (.txt или .docx). None если не получилось."""
+    document = update.message.document
+    if not document:
+        return None
+
+    file_name = (document.file_name or "").lower()
+    tg_file = await context.bot.get_file(document.file_id)
+    file_bytes = bytes(await tg_file.download_as_bytearray())
+
+    if file_name.endswith('.docx'):
+        if not HAS_DOCX:
+            return None
+        return extract_text_from_docx(file_bytes)
+    elif file_name.endswith('.txt'):
+        try:
+            return file_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            return file_bytes.decode('cp1251', errors='ignore')
+    return None
+
+async def send_long_message(update: Update, text: str):
+    """Отправляет длинный текст, разбивая на части по лимиту Telegram (4096)"""
+    if len(text) <= 4096:
+        await update.message.reply_text(text)
+    else:
+        for i in range(0, len(text), 4096):
+            await update.message.reply_text(text[i:i + 4096])
+
+# ============ Управление историей диалога ============
+
+def get_history(context: ContextTypes.DEFAULT_TYPE) -> list:
+    """Возвращает историю диалога, обнуляя её при простое больше CONTEXT_RESET_HOURS."""
+    started_at = context.user_data.get('chat_started_at')
+    if started_at:
+        try:
+            started_dt = datetime.fromisoformat(started_at)
+            if datetime.now() - started_dt > timedelta(hours=CONTEXT_RESET_HOURS):
+                # Контекст устарел — обнуляем
+                context.user_data['history'] = []
+                context.user_data['chat_started_at'] = datetime.now().isoformat()
+                logger.info("Контекст диалога обнулён по истечении суток")
+        except ValueError:
+            context.user_data['chat_started_at'] = datetime.now().isoformat()
+    else:
+        context.user_data['chat_started_at'] = datetime.now().isoformat()
+
+    return context.user_data.setdefault('history', [])
+
+def append_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: str):
+    """Добавляет сообщение в историю и обрезает её до MAX_HISTORY_MESSAGES."""
+    history = context.user_data.setdefault('history', [])
+    history.append({"role": role, "content": content})
+    # Оставляем только последние MAX_HISTORY_MESSAGES сообщений
+    if len(history) > MAX_HISTORY_MESSAGES:
+        del history[:len(history) - MAX_HISTORY_MESSAGES]
+
+# ============ Запрос к Claude ============
+
+def ask_claude(history: list) -> str:
+    """Отправляет диалог в Claude API с кэшированием системного промпта."""
+    system_prompt = build_system_prompt()
+    message = anthropic_client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_TOKENS,
+        system=[
+            {
+                "type": "text",
+                "text": system_prompt,
+                # Кэширование: системный промпт (роль + шаблоны) повторяется
+                # в каждом запросе — платим за него 10% после первого раза.
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        messages=history,
+    )
+    # Логируем использование кэша для контроля экономии
+    usage = message.usage
+    logger.info(
+        f"Tokens — in:{usage.input_tokens} "
+        f"cache_write:{getattr(usage, 'cache_creation_input_tokens', 0)} "
+        f"cache_read:{getattr(usage, 'cache_read_input_tokens', 0)} "
+        f"out:{usage.output_tokens}"
+    )
+    # Собираем текст из всех текстовых блоков ответа
+    parts = [block.text for block in message.content if block.type == "text"]
+    return "\n".join(parts).strip()
+
 # ============ Обработчики команд ============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
-    user_id = update.effective_user.id
     user_name = update.effective_user.full_name
-    
-    if not is_authorized(user_id) and not is_admin(user_id):
-        await update.message.reply_text(
-            f"❌ Доступ запрещён. Свяжитесь с администратором.\n"
-            f"Ваш ID: {user_id}"
+
+    # Новый /start — начинаем диалог заново
+    context.user_data['history'] = []
+    context.user_data['chat_started_at'] = datetime.now().isoformat()
+
+    welcome_text = f"👋 Здравствуйте, {user_name}!\n\n"
+    welcome_text += (
+        "Я — юридический ассистент по недвижимости. Помогаю составлять "
+        "и проверять договоры: купля-продажа, аренда, займ, расписки и другие.\n\n"
+        "Просто пишите мне обычным текстом — как живому человеку. Например:\n"
+        "• «Составь договор аренды квартиры на 11 месяцев, 35 000 руб/мес»\n"
+        "• «Проверь этот договор» (и пришлите текст или файл .txt / .docx)\n"
+        "• «Какие пункты обязательно нужны в договоре купли-продажи?»\n\n"
+        "Если данных не хватит — я уточню.\n\n"
+        "Команды:\n"
+        "/reset — начать диалог заново\n"
+        "/help — справка\n"
+    )
+    if is_admin(update.effective_user.id):
+        welcome_text += (
+            "\nАдмин-команды:\n"
+            "/templates — список шаблонов\n"
+            "/add_template <название> — добавить шаблон (затем пришлите текст/файл)\n"
+            "/del_template <название> — удалить шаблон\n"
         )
-        return ConversationHandler.END
-    
-    welcome_text = f"👋 Добро пожаловать, {user_name}!\n\n"
-    welcome_text += "Я помогу вам генерировать договоры на основе данных клиента.\n\n"
-    welcome_text += "Доступные команды:\n"
-    welcome_text += "/new_contract - Создать новый договор\n"
-    welcome_text += "/help - Справка\n"
-    
-    if is_admin(user_id):
-        welcome_text += "/auth_users - Управление пользователями (админ)\n"
-    
+
     await update.message.reply_text(welcome_text)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /help"""
-    user_id = update.effective_user.id
-    
-    if not is_authorized(user_id) and not is_admin(user_id):
-        await update.message.reply_text("❌ Доступ запрещён")
+    help_text = (
+        "📋 Как пользоваться ботом\n\n"
+        "Просто пишите свободным текстом — бот сам поймёт, что нужно:\n"
+        "• составить договор — опишите задачу (вид договора, стороны, "
+        "объект, сумма, сроки, условия);\n"
+        "• проверить договор — напишите об этом и пришлите текст "
+        "или файл (.txt / .docx);\n"
+        "• задать вопрос по сделкам с недвижимостью.\n\n"
+        "Бот помнит ход беседы, поэтому можно уточнять и дополнять "
+        "по ходу разговора.\n\n"
+        "/reset — забыть текущий диалог и начать заново.\n"
+        f"Контекст также автоматически обнуляется после "
+        f"{CONTEXT_RESET_HOURS} часов простоя.\n\n"
+        "🎙 Голосовые сообщения пока не поддерживаются — пишите текстом.\n\n"
+        "❓ Вопросы — к администратору."
+    )
+    await update.message.reply_text(help_text)
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /reset — очистка контекста диалога"""
+    context.user_data['history'] = []
+    context.user_data['chat_started_at'] = datetime.now().isoformat()
+    await update.message.reply_text(
+        "🔄 Диалог сброшен. Можете начать новый разговор."
+    )
+
+# ============ Шаблоны (только админ) ============
+
+async def templates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /templates — показать список шаблонов"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Команда доступна только администратору.")
         return
-    
-    help_text = """
-📋 **Как использовать бота:**
 
-1. Отправьте команду /new_contract
-2. Введите данные клиента в следующем формате:
-   - ФИО клиента
-   - Должность
-   - Организация
-   - Реквизиты (если нужны)
-
-3. Выберите тип договора
-4. Укажите дополнительные параметры
-
-Бот автоматически сгенерирует договор с использованием AI.
-
-💡 **Примеры типов договоров:**
-- Договор купли-продажи
-- Договор оказания услуг
-- Договор аренды
-- NDA (Соглашение о конфиденциальности)
-- Договор подряда
-
-❓ При вопросах обращайтесь к администратору.
-"""
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
-async def auth_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /auth_users - управление авторизованными пользователями (только для админа)"""
-    user_id = update.effective_user.id
-    
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Только администратор может управлять пользователями")
+    templates = load_templates()
+    if not templates:
+        await update.message.reply_text("📂 Шаблоны пока не добавлены.")
         return
-    
-    users = load_authorized_users()
-    
-    if not users:
-        await update.message.reply_text("📋 Авторизованные пользователи отсутствуют")
-        return
-    
-    text = "📋 **Авторизованные пользователи:**\n\n"
-    for user_id_str, user_info in users.items():
-        status = "✅ Активен" if user_info['active'] else "❌ Заблокирован"
-        text += f"• {user_info['name']} (ID: {user_id_str}) - {status}\n"
-        text += f"  Добавлен: {user_info['added_date']}\n\n"
-    
-    text += "\n/add_user <ID> <Имя> - добавить пользователя\n"
-    text += "/remove_user <ID> - удалить пользователя\n"
-    
-    await update.message.reply_text(text, parse_mode='Markdown')
 
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /add_user - добавить авторизованного пользователя"""
-    user_id = update.effective_user.id
-    
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Только администратор может добавлять пользователей")
+    text = "📂 Доступные шаблоны:\n\n"
+    for name in templates:
+        text += f"• {name}\n"
+    await update.message.reply_text(text)
+
+async def add_template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /add_template <название> — задаёт название и ждёт текст/файл шаблона"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Добавлять шаблоны может только администратор.")
         return
-    
-    if len(context.args) < 2:
+
+    if not context.args:
         await update.message.reply_text(
-            "Используйте: /add_user <ID> <Имя>\n"
-            "Пример: /add_user 123456789 Иван"
+            "Используйте: /add_template <название>\n"
+            "Например: /add_template Договор купли-продажи квартиры\n\n"
+            "После этого пришлите текст шаблона сообщением или файлом (.txt / .docx)."
         )
         return
-    
-    new_user_id = context.args[0]
-    new_user_name = ' '.join(context.args[1:])
-    
-    users = load_authorized_users()
-    users[new_user_id] = {
-        'name': new_user_name,
-        'active': True,
-        'added_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
-    save_authorized_users(users)
-    
-    await update.message.reply_text(f"✅ Пользователь {new_user_name} (ID: {new_user_id}) добавлен")
 
-async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /remove_user - удалить авторизованного пользователя"""
-    user_id = update.effective_user.id
-    
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Только администратор может удалять пользователей")
+    name = ' '.join(context.args)
+    context.user_data['awaiting_template_name'] = name
+    await update.message.reply_text(
+        f"📝 Название шаблона: «{name}».\n"
+        "Теперь пришлите сам текст шаблона — сообщением или файлом (.txt / .docx)."
+    )
+
+async def del_template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /del_template <название> — удалить шаблон"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Удалять шаблоны может только администратор.")
         return
-    
-    if len(context.args) < 1:
-        await update.message.reply_text("Используйте: /remove_user <ID>")
+
+    templates = load_templates()
+    if not templates:
+        await update.message.reply_text("📂 Шаблонов нет.")
         return
-    
-    remove_user_id = context.args[0]
-    users = load_authorized_users()
-    
-    if remove_user_id in users:
-        removed_name = users[remove_user_id]['name']
-        del users[remove_user_id]
-        save_authorized_users(users)
-        await update.message.reply_text(f"✅ Пользователь {removed_name} удалён")
+
+    if not context.args:
+        text = "Используйте: /del_template <название>\n\nДоступные шаблоны:\n"
+        for name in templates:
+            text += f"• {name}\n"
+        await update.message.reply_text(text)
+        return
+
+    name = ' '.join(context.args)
+    if name in templates:
+        del templates[name]
+        save_templates(templates)
+        await update.message.reply_text(f"✅ Шаблон «{name}» удалён.")
     else:
-        await update.message.reply_text("❌ Пользователь не найден")
+        await update.message.reply_text(f"❌ Шаблон «{name}» не найден.")
 
-# ============ Диалог создания договора ============
+# ============ Основной обработчик сообщений ============
 
-async def new_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало создания нового договора"""
+async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Голосовые сообщения пока не поддерживаются"""
+    await update.message.reply_text(
+        "🎙 Голосовые сообщения пока не поддерживаются.\n"
+        "Опишите задачу текстом, и я помогу с договором."
+    )
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает любое текстовое сообщение или документ — свободный диалог."""
     user_id = update.effective_user.id
-    
-    if not is_authorized(user_id) and not is_admin(user_id):
-        await update.message.reply_text("❌ Доступ запрещён")
-        return ConversationHandler.END
-    
-    await update.message.reply_text(
-        "📝 Создание нового договора\n\n"
-        "Введите данные клиента в следующем формате:\n\n"
-        "ФИО: [ФИО клиента]\n"
-        "Должность: [должность]\n"
-        "Организация: [название организации]\n"
-        "Email: [email] (опционально)\n"
-        "Телефон: [телефон] (опционально)\n\n"
-        "Пример:\n"
-        "ФИО: Иван Петров\n"
-        "Должность: Директор\n"
-        "Организация: ООО Рога и Копыта"
-    )
-    
-    return WAITING_FOR_CLIENT_DATA
 
-async def receive_client_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение данных клиента"""
-    user_id = update.effective_user.id
-    
-    if not is_authorized(user_id) and not is_admin(user_id):
-        await update.message.reply_text("❌ Доступ запрещён")
-        return ConversationHandler.END
-    
-    # Сохраняем данные клиента в контексте
-    context.user_data['client_data'] = update.message.text
-    
-    # Показываем кнопки выбора типа договора
-    keyboard = [
-        [InlineKeyboardButton("Купли-продажи", callback_data="contract_sale")],
-        [InlineKeyboardButton("Оказания услуг", callback_data="contract_services")],
-        [InlineKeyboardButton("Аренды", callback_data="contract_rent")],
-        [InlineKeyboardButton("NDA", callback_data="contract_nda")],
-        [InlineKeyboardButton("Подряда", callback_data="contract_work")],
-        [InlineKeyboardButton("Другое", callback_data="contract_other")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "✅ Данные получены\n\n"
-        "Выберите тип договора:",
-        reply_markup=reply_markup
-    )
-    
-    return WAITING_FOR_CONTRACT_TYPE
-
-async def contract_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора типа договора"""
-    query = update.callback_query
-    await query.answer()
-    
-    contract_types = {
-        "contract_sale": "Договор купли-продажи",
-        "contract_services": "Договор оказания услуг",
-        "contract_rent": "Договор аренды",
-        "contract_nda": "NDA (Соглашение о конфиденциальности)",
-        "contract_work": "Договор подряда",
-        "contract_other": "Другой тип"
-    }
-    
-    context.user_data['contract_type'] = contract_types[query.data]
-    
-    await query.edit_message_text(
-        text=f"Выбран тип: **{context.user_data['contract_type']}**\n\n"
-        "Введите дополнительные параметры договора (сумма, сроки, условия и т.д.):\n\n"
-        "Или напишите 'готово' если параметров нет",
-        parse_mode='Markdown'
-    )
-    
-    return WAITING_FOR_CONTRACT_PARAMS
-
-async def receive_contract_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение параметров договора"""
-    user_id = update.effective_user.id
-    
-    if not is_authorized(user_id) and not is_admin(user_id):
-        await update.message.reply_text("❌ Доступ запрещён")
-        return ConversationHandler.END
-    
-    if update.message.text.lower() != 'готово':
-        context.user_data['contract_params'] = update.message.text
-    else:
-        context.user_data['contract_params'] = "Стандартные условия"
-    
-    # Начинаем генерацию договора
-    await update.message.reply_text("⏳ Генерирую договор с помощью Claude AI...")
-    
-    # Генерируем договор
-    contract_text = await generate_contract(
-        context.user_data['client_data'],
-        context.user_data['contract_type'],
-        context.user_data['contract_params']
-    )
-    
-    # Сохраняем договор в файл (в постоянном хранилище)
-    filename = f"contract_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    filepath = os.path.join(CONTRACTS_DIR, filename)
-    context.user_data['contract_filename'] = filename
-    context.user_data['contract_filepath'] = filepath
-
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(contract_text)
-    
-    # Отправляем договор
-    await update.message.reply_text(
-        f"✅ Договор успешно сгенерирован!\n\n"
-        f"Тип: {context.user_data['contract_type']}\n"
-        f"Файл: {filename}"
-    )
-    
-    # Отправляем текст договора (разбиваем на части, если очень большой)
-    if len(contract_text) > 4096:
-        # Telegram лимит на сообщение - 4096 символов
-        for i in range(0, len(contract_text), 4096):
-            await update.message.reply_text(contract_text[i:i+4096])
-    else:
-        await update.message.reply_text(contract_text)
-    
-    # Предлагаем дополнительные действия
-    keyboard = [
-        [InlineKeyboardButton("📝 Создать новый договор", callback_data="new_contract_again")],
-        [InlineKeyboardButton("💾 Скачать договор", callback_data="download_contract")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "Что дальше?",
-        reply_markup=reply_markup
-    )
-    
-    return ConversationHandler.END
-
-async def generate_contract(client_data: str, contract_type: str, params: str) -> str:
-    """Генерирует договор с помощью Claude API"""
-    prompt = f"""
-Ты опытный юрист, специалист по составлению договоров. 
-Сгенерируй профессиональный договор на основе следующих данных:
-
-ТИП ДОГОВОРА: {contract_type}
-
-ДАННЫЕ КЛИЕНТА:
-{client_data}
-
-ПАРАМЕТРЫ И УСЛОВИЯ:
-{params}
-
-Требования:
-1. Договор должен быть полным и готовым к подписанию
-2. Используй профессиональную юридическую терминологию
-3. Включи все необходимые разделы (стороны, предмет, условия, права и обязанности, сроки, стоимость и т.д.)
-4. Договор должен соответствовать российскому законодательству
-5. Текст должен быть четким и понятным
-
-Выведи только текст договора без предисловий и комментариев.
-"""
-    
-    message = anthropic_client.messages.create(
-        model="claude-opus-4-1-20250805",
-        max_tokens=4000,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    )
-    
-    return message.content[0].text
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена операции"""
-    await update.message.reply_text("❌ Операция отменена")
-    return ConversationHandler.END
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "new_contract_again":
-        return await new_contract(update, context)
-    elif query.data == "download_contract":
-        # Отправляем файл договора
-        filename = context.user_data.get('contract_filename')
-        filepath = context.user_data.get('contract_filepath')
-        if filepath and os.path.exists(filepath):
-            await query.edit_message_text(
-                text="💾 Договор готов к скачиванию\n"
-                f"Файл: {filename}\n\n"
-                "Используйте /start для новой операции"
+    # Извлекаем текст из сообщения или присланного файла
+    incoming_text = None
+    if update.message.document:
+        incoming_text = await read_document_text(update, context)
+        if incoming_text is None:
+            await update.message.reply_text(
+                "❌ Не удалось прочитать файл. Поддерживаются .txt и .docx. "
+                "Можно также прислать текст сообщением."
             )
-        else:
-            await query.edit_message_text(text="❌ Файл не найден")
+            return
+    elif update.message.text:
+        incoming_text = update.message.text
+
+    if not incoming_text or not incoming_text.strip():
+        await update.message.reply_text("Пришлите текст — я помогу с договором.")
+        return
+
+    # Режим добавления шаблона (админ ранее вызвал /add_template <название>)
+    if is_admin(user_id) and context.user_data.get('awaiting_template_name'):
+        name = context.user_data.pop('awaiting_template_name')
+        templates = load_templates()
+        templates[name] = incoming_text.strip()
+        save_templates(templates)
+        await update.message.reply_text(
+            f"✅ Шаблон «{name}» сохранён и доступен всем пользователям."
+        )
+        return
+
+    # Свободный диалог с Claude
+    history = get_history(context)
+    append_history(context, "user", incoming_text)
+
+    await update.message.chat.send_action("typing")
+
+    try:
+        answer = ask_claude(context.user_data['history'])
+    except Exception as e:
+        logger.error(f"Ошибка запроса к Claude: {e}")
+        # Откатываем последнее сообщение пользователя, чтобы можно было повторить
+        if context.user_data.get('history'):
+            context.user_data['history'].pop()
+        await update.message.reply_text(
+            "❌ Не удалось получить ответ. Попробуйте ещё раз чуть позже."
+        )
+        return
+
+    if not answer:
+        answer = "Извините, не удалось сформировать ответ. Попробуйте переформулировать."
+
+    append_history(context, "assistant", answer)
+    await send_long_message(update, answer + DISCLAIMER)
 
 # ============ Основная функция ============
 
@@ -445,46 +442,28 @@ def main():
     if not TELEGRAM_TOKEN or not ANTHROPIC_API_KEY:
         logger.error("Не установлены переменные окружения TELEGRAM_BOT_TOKEN или ANTHROPIC_API_KEY")
         return
-    
-    # Создаем приложение
+
     application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Инициализируем файл с пользователями, если его нет
-    if not os.path.exists(AUTHORIZED_USERS_FILE):
-        save_authorized_users({str(ADMIN_ID): {
-            'name': 'Администратор',
-            'active': True,
-            'added_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }})
-    
-    # Создаем обработчик диалога
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("new_contract", new_contract)],
-        states={
-            WAITING_FOR_CLIENT_DATA: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_client_data)
-            ],
-            WAITING_FOR_CONTRACT_TYPE: [
-                CallbackQueryHandler(contract_type_selected, pattern=r"^contract_"),
-                CommandHandler("cancel", cancel),
-            ],
-            WAITING_FOR_CONTRACT_PARAMS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_contract_params)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    
-    # Добавляем обработчики
+
+    # Команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("auth_users", auth_users))
-    application.add_handler(CommandHandler("add_user", add_user))
-    application.add_handler(CommandHandler("remove_user", remove_user))
-    application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Запускаем бота
+    application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(CommandHandler("templates", templates_command))
+    application.add_handler(CommandHandler("add_template", add_template_command))
+    application.add_handler(CommandHandler("del_template", del_template_command))
+
+    # Голосовые — пока не поддерживаются
+    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice_handler))
+
+    # Любой текст или документ вне команд — свободный диалог
+    application.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND,
+            message_handler
+        )
+    )
+
     logger.info("🚀 Бот запущен")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
