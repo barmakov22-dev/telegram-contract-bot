@@ -11,6 +11,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ConversationHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -51,8 +52,20 @@ logger.info(f"✅ TELEGRAM_TOKEN: {TELEGRAM_TOKEN[:10]}...")
 logger.info(f"✅ ANTHROPIC_API_KEY: {ANTHROPIC_API_KEY[:10]}...")
 logger.info(f"✅ ADMIN_ID: {ADMIN_ID}")
 
-# Файл с авторизованными пользователями
-AUTHORIZED_USERS_FILE = 'authorized_users.json'
+# Директория для постоянного хранения данных.
+# На Railway сюда монтируется Volume через переменную DATA_DIR (например /data).
+# Локально, если переменная не задана, используется текущая папка.
+DATA_DIR = os.environ.get('DATA_DIR', '.')
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Папка для сгенерированных договоров внутри постоянного хранилища
+CONTRACTS_DIR = os.path.join(DATA_DIR, 'contracts')
+os.makedirs(CONTRACTS_DIR, exist_ok=True)
+
+# Файл с авторизованными пользователями (в постоянном хранилище)
+AUTHORIZED_USERS_FILE = os.path.join(DATA_DIR, 'authorized_users.json')
+
+logger.info(f"✅ DATA_DIR: {DATA_DIR}")
 
 # Состояния для ConversationHandler
 WAITING_FOR_CLIENT_DATA = 1
@@ -325,11 +338,13 @@ async def receive_contract_params(update: Update, context: ContextTypes.DEFAULT_
         context.user_data['contract_params']
     )
     
-    # Сохраняем договор в файл
+    # Сохраняем договор в файл (в постоянном хранилище)
     filename = f"contract_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    filepath = os.path.join(CONTRACTS_DIR, filename)
     context.user_data['contract_filename'] = filename
-    
-    with open(filename, 'w', encoding='utf-8') as f:
+    context.user_data['contract_filepath'] = filepath
+
+    with open(filepath, 'w', encoding='utf-8') as f:
         f.write(contract_text)
     
     # Отправляем договор
@@ -386,7 +401,7 @@ async def generate_contract(client_data: str, contract_type: str, params: str) -
 """
     
     message = anthropic_client.messages.create(
-        model="claude-opus-4-20250805",
+        model="claude-opus-4-1-20250805",
         max_tokens=4000,
         messages=[
             {
@@ -413,7 +428,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "download_contract":
         # Отправляем файл договора
         filename = context.user_data.get('contract_filename')
-        if filename and os.path.exists(filename):
+        filepath = context.user_data.get('contract_filepath')
+        if filepath and os.path.exists(filepath):
             await query.edit_message_text(
                 text="💾 Договор готов к скачиванию\n"
                 f"Файл: {filename}\n\n"
@@ -449,6 +465,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_client_data)
             ],
             WAITING_FOR_CONTRACT_TYPE: [
+                CallbackQueryHandler(contract_type_selected, pattern=r"^contract_"),
                 CommandHandler("cancel", cancel),
             ],
             WAITING_FOR_CONTRACT_PARAMS: [
@@ -465,7 +482,7 @@ def main():
     application.add_handler(CommandHandler("add_user", add_user))
     application.add_handler(CommandHandler("remove_user", remove_user))
     application.add_handler(conv_handler)
-    application.add_handler(MessageHandler(filters.CALLBACK_QUERY, button_callback))
+    application.add_handler(CallbackQueryHandler(button_callback))
     
     # Запускаем бота
     logger.info("🚀 Бот запущен")
